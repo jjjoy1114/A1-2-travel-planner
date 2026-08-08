@@ -48,6 +48,11 @@ def parse_arguments():
         required=True,
         help='여행 날짜, 형식은 YYYY-MM-DD (예: --date "2026-08-15")',
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="이미 저장된 결과가 있어도 API 를 다시 호출해 새로 만든다",
+    )
     return parser.parse_args()
 
 
@@ -94,9 +99,19 @@ def load_api_keys():
 # ---------------------------------------------------------------------------
 # 3) Gemini 로 여행지 추천 (JSON)
 # ---------------------------------------------------------------------------
-def build_prompt(travel_date):
-    """Gemini 에게 보낼 지시문. 반드시 JSON 만 출력하도록 요청한다."""
-    return f"""당신은 한국 국내 여행 플래너입니다.
+def build_prompt(travel_date, reinforce=False):
+    """
+    Gemini 에게 보낼 지시문. 반드시 JSON 만 출력하도록 요청한다.
+    reinforce=True 이면(=재요청 시) '이전 응답이 올바른 JSON이 아니었다'는
+    안내를 앞에 붙여 프롬프트를 보강한다.
+    """
+    prefix = ""
+    if reinforce:
+        prefix = (
+            "직전 응답이 올바른 JSON 이 아니었습니다. "
+            "이번에는 코드블록(```)이나 설명 없이, 아래 형식의 순수 JSON 만 출력하세요.\n\n"
+        )
+    return prefix + f"""당신은 한국 국내 여행 플래너입니다.
 여행 날짜: {travel_date}
 
 이 날짜에 국내 여행지로 좋은 도시 2~3곳을 추천해 주세요.
@@ -189,9 +204,9 @@ def get_recommendations(client, travel_date, model_name, errors):
     Gemini 를 호출해 추천 도시 목록을 받는다.
     JSON 파싱에 실패하면 딱 1번만 재요청한다(무한 반복 금지).
     """
-    prompt = build_prompt(travel_date)
-
     for attempt in range(1, 3):  # 최대 2번 시도 (최초 + 재요청 1회)
+        # 재요청(2번째 시도)일 때는 프롬프트를 보강해서 다시 보낸다
+        prompt = build_prompt(travel_date, reinforce=(attempt > 1))
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -225,14 +240,34 @@ def get_recommendations(client, travel_date, model_name, errors):
 # ---------------------------------------------------------------------------
 # 4) Kakao 로 도시별 맛집 검색
 # ---------------------------------------------------------------------------
+def normalize_city(name):
+    """
+    LLM 이 준 도시 이름을 Kakao 검색에 넣기 좋게 간단히 다듬는다.
+    - 괄호와 그 안 내용 제거:  '강릉(경포대)' -> '강릉'
+    - 쉼표 뒤 부가 설명 제거:  '부산, 해운대' -> '부산'
+    - 앞뒤 공백 정리
+    (지명 세분화·법정동 보정까지는 하지 않는 최소 정규화이다.)
+    """
+    import re
+
+    text = str(name)
+    text = re.sub(r"\(.*?\)", "", text)   # 괄호 내용 제거
+    text = text.split(",")[0]             # 쉼표 앞부분만
+    return text.strip()
+
+
 def search_restaurants(kakao_key, city, errors, max_count=5):
     """
     Kakao 로컬 키워드 검색으로 '<도시> 맛집' 을 찾는다.
     실패하거나 결과가 없으면 빈 목록을 돌려주고, 프로그램은 계속 진행한다.
+
+    HTTP 메서드: GET (장소 '조회'이므로 GET 을 사용한다)
+    인증: 요청 헤더 'Authorization: KakaoAK {REST_API_KEY}'
     """
+    query_city = normalize_city(city)  # 도시명 정규화 후 검색
     url = "https://dapi.kakao.com/v2/local/search/keyword.json"
     headers = {"Authorization": f"KakaoAK {kakao_key}"}
-    params = {"query": f"{city} 맛집", "size": max_count}
+    params = {"query": f"{query_city} 맛집", "size": max_count}
 
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=10)
@@ -267,6 +302,22 @@ def save_raw_json(result, date_text):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     return path
+
+
+def load_cached_result(date_text):
+    """
+    같은 날짜의 원본 JSON 이 이미 results/ 에 있으면 불러온다(캐시).
+    없거나 읽기에 실패하면 None 을 돌려준다.
+    캐시 위치: results/{날짜}_raw.json  (만료 정책: 없음 — 파일을 지우면 갱신)
+    """
+    path = os.path.join("results", f"{date_text}_raw.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+    return None
 
 
 def build_markdown(result):
@@ -328,6 +379,17 @@ def main():
     travel_date = validate_date(args.date)
     date_text = travel_date.isoformat()
     print(f"[진행] 여행 날짜: {date_text}")
+
+    # 1-b) 캐싱(보너스): 같은 날짜 결과가 이미 있으면 API 호출을 건너뛴다
+    if not args.refresh:
+        cached = load_cached_result(date_text)
+        if cached:
+            md_path = save_markdown(build_markdown(cached), date_text)
+            print("[캐시] 저장된 결과를 재사용합니다 (API 호출 생략, 비용/속도 절약).")
+            print("       새로 만들려면 --refresh 옵션을 붙이세요.")
+            print(f"   - 원본 데이터 : results/{date_text}_raw.json")
+            print(f"   - 여행 리포트 : {md_path}")
+            return
 
     # 2) 키
     gemini_key, kakao_key = load_api_keys()
