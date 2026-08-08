@@ -78,6 +78,9 @@ python travel_planner.py --date "2026-08-15"
 
 # 3) 같은 날짜를 강제로 다시 만들기 (캐시 무시하고 API 재호출)
 python travel_planner.py --date "2026-08-15" --refresh
+
+# 4) 캐시 유효 시간 지정 (예: 24시간 지난 결과는 새로 만들기)
+python travel_planner.py --date "2026-08-15" --max-age-hours 24
 ```
 
 정상 실행되면 아래처럼 진행 로그가 출력되고, 마지막에 결과 파일 위치를 알려줍니다.
@@ -131,6 +134,7 @@ Markdown 파일은 VS Code의 **미리보기**로 열면 깔끔하게 렌더링�
 
 ```json
 {
+  "schema_version": "1.0",
   "date": "2026-08-15",
   "recommended_cities": [
     {
@@ -147,7 +151,28 @@ Markdown 파일은 VS Code의 **미리보기**로 열면 깔끔하게 렌더링�
 }
 ```
 
-> 과제 **기본 스키마**는 단일 도시(`recommended_city`)이지만, 본 프로젝트는 **보너스(복수 지역 추천)**를 반영해 이를 리스트 형태의 `recommended_cities`로 확장했습니다. 코드(`build_prompt`, `validate_recommendation`)와 이 문서 모두 동일하게 `recommended_cities`를 사용합니다.
+**필드 타입(필수/선택)**
+
+| 키 | 타입 | 필수 | 설명 |
+|---|---|---|---|
+| `schema_version` | string | 필수 | 결과 형식 버전(파싱 호환성 관리용) |
+| `date` | string | 필수 | 여행 날짜 `YYYY-MM-DD` |
+| `recommended_cities[].city` | string | 필수 | 도시명 |
+| `recommended_cities[].weather` | string | 필수 | 날씨 요약 |
+| `recommended_cities[].events` | string[] | 선택 | 행사/활동 후보 |
+| `recommended_cities[].reason` | string | 필수 | 추천 이유 |
+| `recommended_cities[].restaurants[]` | object[] | 선택 | 맛집(name·address·category·url·x·y) |
+| `errors` | string[] | 필수 | 처리 중 문제 기록(빈 배열 가능) |
+
+> 과제 **기본 스키마**는 단일 도시(`recommended_city`)이지만, 본 프로젝트는 **보너스(복수 지역 추천)**를 반영해 이를 리스트 형태의 `recommended_cities`로 확장했습니다. 코드(`build_prompt`, `check_recommendation`)와 이 문서 모두 동일하게 `recommended_cities`를 사용합니다.
+
+**핵심 함수 계약(인터페이스)** — 다른 지도 제공자로 교체할 때 이 시그니처만 지키면 됩니다.
+
+| 함수 | 입력 | 출력 |
+|---|---|---|
+| `search_restaurants(kakao_key, city, errors)` | 키·도시명·오류목록 | 맛집 dict 리스트(실패/0건이면 `[]`) |
+| `get_recommendations(client, date, model, errors)` | Gemini 클라이언트·날짜·모델·오류목록 | 도시 dict 리스트 |
+| `normalize_city(name)` | 도시명 문자열 | 정규화된 도시명 문자열 |
 
 ## 🌐 REST API 요청 방식 (HTTP 메서드)
 
@@ -170,19 +195,27 @@ Markdown 파일은 VS Code의 **미리보기**로 열면 깔끔하게 렌더링�
 
 확인 순서: ① 로그의 상태 코드 → ② 요청 헤더 `Authorization` 값 → ③ 카카오 콘솔 카카오맵 사용 설정 → ④ 호출 허용 IP. 본 프로그램은 이런 오류가 나도 해당 도시를 "데이터 없음"으로 처리하고 `errors`에 기록한 뒤 계속 진행합니다.
 
+- **오류 카테고리 태그**: `errors` 항목은 원인별로 `[AUTH]`(인증/권한), `[NETWORK]`(네트워크/HTTP), `[PARSE]`(JSON 파싱)로 태그를 붙여 기록합니다. 401/403은 재시도해도 소용없어 즉시 포기하고, 그 외 네트워크 오류는 짧은 backoff(0.5초·1초)로 최대 2회 재시도합니다.
+- **디버깅 로그 시 민감정보 마스킹**: 요청/응답을 로그로 남길 때는 키가 노출되지 않도록 `Authorization` 헤더 값을 반드시 마스킹하세요. (예: `KakaoAK ****`, Gemini 키는 앞 4자리만 남기고 `AQ.****`) 이 프로그램은 오류 로그에 키 값을 출력하지 않습니다.
+
 ## 🧭 설계 노트
 
 - **지도 API 추상화** — 장소 검색은 `search_restaurants()` **한 함수로 분리**했습니다. 다른 지도 제공자(예: 네이버)로 교체하려면 이 함수 내부(요청 URL·헤더·응답 파싱)만 바꾸면 되고 나머지 흐름은 그대로 재사용됩니다.
 - **도시명 정규화** — LLM이 준 도시명을 `normalize_city()`로 **괄호·쉼표 뒤 부가설명을 제거**한 뒤 검색합니다. (예: `강릉(경포대)` → `강릉`)
 - **재요청 시 프롬프트 보강** — Gemini 응답이 올바른 JSON이 아니면 **1회** 재요청하며, 이때 "순수 JSON만 출력하라"는 안내를 프롬프트에 덧붙여 성공률을 높입니다.
-- **결과 캐싱** — 같은 `--date` 재실행 시 `results/{날짜}_raw.json`을 재사용(만료 정책 없음, 파일 삭제 시 갱신). `--refresh`로 강제 재호출.
+- **결과 캐싱** — 같은 `--date` 재실행 시 `results/{날짜}_raw.json`을 재사용. `--refresh`로 강제 재호출하고, `--max-age-hours N`으로 **N시간 지난 캐시는 자동 갱신**(간단한 TTL)할 수 있습니다. (기본 만료 정책: 없음 — 파일 삭제 시 갱신)
+- **네트워크 재시도** — Kakao 검색은 일시적 네트워크 오류에 짧은 backoff로 최대 2회 재시도합니다. 단, 401/403(인증·권한) 오류는 재시도해도 소용없어 즉시 "데이터 없음"으로 넘어갑니다.
+- **데이터 없음 요약** — 리포트 상단과 실행 로그에 맛집이 0건인 도시 수를 요약해 표시합니다.
 
 ## 🔐 API 키 보안 주의사항
+
+> ⚠️ **키가 노출되었다면? → 즉시 해당 서비스에서 키를 재발급(폐기 후 새로 생성)하세요.** 노출된 키는 되돌릴 수 없으므로, 코드/커밋/캡처 어디에도 실제 키가 없는지 반드시 확인합니다.
 
 - 실제 키는 **`.env` 파일에만** 저장하며, 코드에 직접 쓰지 않습니다.
 - `.gitignore`에 `.env`가 포함되어 있어 **GitHub에 키가 올라가지 않습니다.**
 - 공유·제출 시에는 값이 비어 있는 `.env.example`만 올립니다.
-- 혹시라도 키가 외부에 노출되면 **즉시 재발급**하세요.
+- **운영 환경 권장** — 키는 환경변수 또는 시크릿 매니저로 주입하고, **정기적으로 회전(교체)**합니다. 키를 `.env`로 분리해 두면 코드 수정 없이 값만 바꿔 회전할 수 있습니다.
+- 오류 로그나 디버깅 출력에 **키 값을 남기지 않습니다**(위 디버깅 섹션의 마스킹 참고).
 
 ## 🧩 사용 기술 요약
 
