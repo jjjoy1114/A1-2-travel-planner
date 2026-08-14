@@ -141,7 +141,12 @@ def build_prompt(travel_date, reinforce=False):
       "city": "도시 이름 (예: 제주, 부산, 강릉)",
       "weather": "이 시기의 일반적인 날씨 요약",
       "events": ["이 시기에 어울리는 행사/축제/활동 1", "활동 2"],
-      "reason": "이 도시를 추천하는 이유 2~4문장"
+      "reason": "이 도시를 추천하는 이유 2~4문장",
+      "itinerary": {{
+        "morning": "오전 일정 제안 한 문장",
+        "afternoon": "오후 일정 제안 한 문장",
+        "evening": "저녁 일정 제안 한 문장"
+      }}
     }}
   ]
 }}
@@ -149,6 +154,7 @@ def build_prompt(travel_date, reinforce=False):
 주의:
 - city 는 Kakao 지도에서 검색 가능한 실제 한국 도시/지역명으로 쓰세요.
 - 반드시 2곳 이상 3곳 이하로 추천하세요.
+- itinerary 는 오전/오후/저녁 각각 한 문장으로 간단히 제안하세요.
 """
 
 
@@ -218,22 +224,36 @@ def pick_model(client, errors):
     return "gemini-2.0-flash"
 
 
-def get_recommendations(client, travel_date, model_name, errors):
+def is_transient_error(message):
+    """서버 혼잡·일시적 오류인지 판단한다(재시도하면 될 가능성이 큰 오류)."""
+    keys = ["503", "UNAVAILABLE", "overloaded", "high demand", "500",
+            "deadline", "timeout", "Timeout", "temporarily"]
+    return any(k in message for k in keys)
+
+
+def get_recommendations(client, travel_date, model_name, errors, max_attempts=5):
     """
     Gemini 를 호출해 추천 도시 목록을 받는다.  (HTTP 메서드: POST — 프롬프트 본문 전송)
-    JSON 파싱에 실패하면 딱 1번만 재요청하며, 이때 프롬프트를 보강한다(무한 반복 금지).
+    - 서버 혼잡(503 등) 같은 '일시적 오류'는 잠깐 쉬었다(backoff) 최대 max_attempts 번 재시도.
+    - JSON 파싱/구조 오류는 프롬프트를 보강해 다시 요청(무한 반복은 시도 횟수로 제한).
     """
-    for attempt in range(1, 3):  # 최대 2번 시도 (최초 + 재요청 1회)
-        prompt = build_prompt(travel_date, reinforce=(attempt > 1))
+    parse_fail = False  # 직전이 '파싱/구조 오류'였으면 프롬프트를 보강한다
+    for attempt in range(1, max_attempts + 1):
+        prompt = build_prompt(travel_date, reinforce=parse_fail)
         try:
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
             )
             raw_text = response.text
-        except Exception as e:  # 네트워크/인증/쿼터 등 모든 호출 오류
+        except Exception as e:  # 네트워크/인증/쿼터/서버혼잡 등 모든 호출 오류
             errors.append(f"[NETWORK] Gemini 호출 실패(시도 {attempt}): {e}")
-            print(f"[경고] Gemini 호출 실패 (시도 {attempt}): {e}")
+            if is_transient_error(str(e)) and attempt < max_attempts:
+                wait = 3 * attempt  # 3초, 6초, 9초 … 점점 길게 쉬었다 재시도
+                print(f"[경고] Gemini 서버가 혼잡합니다(시도 {attempt}). {wait}초 후 다시 시도합니다...")
+                time.sleep(wait)
+            else:
+                print(f"[경고] Gemini 호출 실패 (시도 {attempt}): {e}")
             continue
 
         cleaned = clean_json_text(raw_text)
@@ -244,7 +264,8 @@ def get_recommendations(client, travel_date, model_name, errors):
             errors.append(
                 f"[PARSE] Gemini JSON 파싱 실패(시도 {attempt}): {e} | 응답 원문: {snippet}"
             )
-            print(f"[경고] 응답을 JSON 으로 읽지 못했습니다 (시도 {attempt}). 재요청합니다.")
+            print(f"[경고] 응답을 JSON 으로 읽지 못했습니다 (시도 {attempt}). 프롬프트를 보강해 재요청합니다.")
+            parse_fail = True
             continue
 
         problem = check_recommendation(data)
@@ -252,8 +273,9 @@ def get_recommendations(client, travel_date, model_name, errors):
             return data["recommended_cities"]
         errors.append(f"[PARSE] Gemini 응답 구조 오류(시도 {attempt}): {problem}")
         print(f"[경고] 추천 결과 구조 오류 (시도 {attempt}): {problem}")
+        parse_fail = True
 
-    print("[오류] Gemini 추천을 받지 못했습니다. 프로그램을 종료합니다.")
+    print("[오류] Gemini 추천을 받지 못했습니다. 서버 혼잡일 수 있으니 잠시 후 다시 실행해 주세요.")
     sys.exit(1)
 
 
@@ -392,6 +414,18 @@ def build_markdown(result):
         if events:
             lines.append(f"- **추천 활동/행사**: {', '.join(events)}")
         lines.append(f"- **추천 이유**: {city.get('reason', '')}\n")
+
+        # 1일 일정 제안 (오전/오후/저녁) — itinerary 가 있을 때만 표시
+        itinerary = city.get("itinerary") or {}
+        if itinerary:
+            lines.append("### 🗓️ 1일 일정 제안")
+            if itinerary.get("morning"):
+                lines.append(f"- **오전**: {itinerary['morning']}")
+            if itinerary.get("afternoon"):
+                lines.append(f"- **오후**: {itinerary['afternoon']}")
+            if itinerary.get("evening"):
+                lines.append(f"- **저녁**: {itinerary['evening']}")
+            lines.append("")
 
         lines.append("### 🍽️ 추천 맛집")
         restaurants = city.get("restaurants") or []

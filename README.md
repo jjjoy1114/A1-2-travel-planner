@@ -8,6 +8,7 @@
 - 여행 날짜(`--date`)를 입력받아 형식·유효성 검증
 - Gemini로 국내 여행지 **복수 지역(2~3곳)** 추천 (날씨·추천 활동·추천 이유 포함)
 - 추천된 각 도시마다 Kakao로 맛집 최대 5곳 검색 (이름·주소·분류·지도 링크)
+- 도시별 **1일 일정(오전·오후·저녁)** 제안 포함
 - 결과를 **원본 JSON** + **읽기 좋은 Markdown 리포트**로 저장
 - 외부 API가 실패해도 프로그램이 멈추지 않고 "데이터 없음"으로 계속 진행
 - **결과 캐싱(보너스)** — 같은 날짜 재실행 시 API 호출을 생략하고 저장된 결과 재사용
@@ -142,6 +143,7 @@ Markdown 파일은 VS Code의 **미리보기**로 열면 깔끔하게 렌더링�
       "weather": "이 시기의 날씨 요약",
       "events": ["행사/활동 1", "행사/활동 2"],
       "reason": "추천 이유 2~4문장",
+      "itinerary": { "morning": "오전 일정", "afternoon": "오후 일정", "evening": "저녁 일정" },
       "restaurants": [
         { "name": "...", "address": "...", "category": "...", "url": "...", "x": "127.0", "y": "37.0" }
       ]
@@ -161,6 +163,7 @@ Markdown 파일은 VS Code의 **미리보기**로 열면 깔끔하게 렌더링�
 | `recommended_cities[].weather` | string | 필수 | 날씨 요약 |
 | `recommended_cities[].events` | string[] | 선택 | 행사/활동 후보 |
 | `recommended_cities[].reason` | string | 필수 | 추천 이유 |
+| `recommended_cities[].itinerary` | object | 선택 | 1일 일정(morning·afternoon·evening) |
 | `recommended_cities[].restaurants[]` | object[] | 선택 | 맛집(name·address·category·url·x·y) |
 | `errors` | string[] | 필수 | 처리 중 문제 기록(빈 배열 가능) |
 
