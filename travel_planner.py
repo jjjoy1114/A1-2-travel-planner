@@ -231,15 +231,25 @@ def is_transient_error(message):
     return any(k in message for k in keys)
 
 
-def get_recommendations(client, travel_date, model_name, errors, max_attempts=5):
+def get_recommendations(client, travel_date, model_name, errors,
+                        max_network_retries=4, max_parse_retries=1):
     """
     Gemini 를 호출해 추천 도시 목록을 받는다.  (HTTP 메서드: POST — 프롬프트 본문 전송)
-    - 서버 혼잡(503 등) 같은 '일시적 오류'는 잠깐 쉬었다(backoff) 최대 max_attempts 번 재시도.
-    - JSON 파싱/구조 오류는 프롬프트를 보강해 다시 요청(무한 반복은 시도 횟수로 제한).
+
+    재시도 예산을 '두 종류로 분리'해 관리한다:
+      - 네트워크/서버 오류(503 등 일시적 오류): backoff 후 최대 max_network_retries 번 재시도.
+        (같은 요청을 다시 보낼 뿐, 프롬프트는 보강하지 않는다.)
+      - JSON 파싱/구조 오류: 프롬프트를 보강해 '딱 1번만' 재요청한다(무한 반복 금지).
+        (max_parse_retries=1 로 고정 — 과제 제약: 파싱 실패 재시도는 최대 1회.)
     """
-    parse_fail = False  # 직전이 '파싱/구조 오류'였으면 프롬프트를 보강한다
-    for attempt in range(1, max_attempts + 1):
-        prompt = build_prompt(travel_date, reinforce=parse_fail)
+    network_attempts = 0  # 지금까지 쓴 네트워크 재시도 횟수
+    parse_attempts = 0    # 지금까지 쓴 파싱 재요청 횟수
+    reinforce = False     # 직전이 '파싱/구조 오류'였으면 다음 프롬프트를 보강한다
+
+    while True:
+        prompt = build_prompt(travel_date, reinforce=reinforce)
+
+        # (1) 호출 — 네트워크/서버 오류는 '네트워크 예산'으로만 재시도한다
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -247,36 +257,44 @@ def get_recommendations(client, travel_date, model_name, errors, max_attempts=5)
             )
             raw_text = response.text
         except Exception as e:  # 네트워크/인증/쿼터/서버혼잡 등 모든 호출 오류
-            errors.append(f"[NETWORK] Gemini 호출 실패(시도 {attempt}): {e}")
-            if is_transient_error(str(e)) and attempt < max_attempts:
-                wait = 3 * attempt  # 3초, 6초, 9초 … 점점 길게 쉬었다 재시도
-                print(f"[경고] Gemini 서버가 혼잡합니다(시도 {attempt}). {wait}초 후 다시 시도합니다...")
+            errors.append(f"[NETWORK] Gemini 호출 실패: {e}")
+            if is_transient_error(str(e)) and network_attempts < max_network_retries:
+                network_attempts += 1
+                wait = 3 * network_attempts  # 3초, 6초, 9초 … 점점 길게 쉬었다 재시도
+                print(f"[경고] Gemini 서버가 혼잡합니다. {wait}초 후 다시 시도합니다"
+                      f" (네트워크 재시도 {network_attempts}/{max_network_retries}).")
                 time.sleep(wait)
-            else:
-                print(f"[경고] Gemini 호출 실패 (시도 {attempt}): {e}")
-            continue
+                continue  # 같은 요청을 다시 (파싱 예산과 무관)
+            print(f"[오류] Gemini 호출에 실패했습니다: {e}")
+            sys.exit(1)
 
+        # (2) 파싱 + 구조 검증 — 실패는 '파싱 예산'으로만 재요청한다
         cleaned = clean_json_text(raw_text)
         try:
             data = json.loads(cleaned)
         except json.JSONDecodeError as e:
             snippet = cleaned[:120].replace("\n", " ")  # 원문 앞부분(디버깅용)
-            errors.append(
-                f"[PARSE] Gemini JSON 파싱 실패(시도 {attempt}): {e} | 응답 원문: {snippet}"
-            )
-            print(f"[경고] 응답을 JSON 으로 읽지 못했습니다 (시도 {attempt}). 프롬프트를 보강해 재요청합니다.")
-            parse_fail = True
-            continue
+            errors.append(f"[PARSE] Gemini JSON 파싱 실패: {e} | 응답 원문: {snippet}")
+            problem = "응답이 올바른 JSON 형식이 아님"
+        else:
+            problem = check_recommendation(data)  # 정상이면 None
+            if problem:
+                errors.append(f"[PARSE] Gemini 응답 구조 오류: {problem}")
 
-        problem = check_recommendation(data)
         if problem is None:
             return data["recommended_cities"]
-        errors.append(f"[PARSE] Gemini 응답 구조 오류(시도 {attempt}): {problem}")
-        print(f"[경고] 추천 결과 구조 오류 (시도 {attempt}): {problem}")
-        parse_fail = True
 
-    print("[오류] Gemini 추천을 받지 못했습니다. 서버 혼잡일 수 있으니 잠시 후 다시 실행해 주세요.")
-    sys.exit(1)
+        # 파싱/구조 오류 → 프롬프트를 보강해 '최대 1회'만 재요청, 그 다음엔 종료
+        if parse_attempts < max_parse_retries:
+            parse_attempts += 1
+            reinforce = True
+            print(f"[경고] 응답을 JSON 으로 읽지 못했습니다({problem}). "
+                  f"프롬프트를 보강해 재요청합니다 (파싱 재시도 {parse_attempts}/{max_parse_retries}).")
+            continue
+
+        print("[오류] Gemini 응답을 올바른 JSON 으로 받지 못했습니다 "
+              "(재요청 1회 후 종료). 잠시 후 다시 실행해 주세요.")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
